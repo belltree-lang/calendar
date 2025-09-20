@@ -22,6 +22,8 @@
 
 const TZ = 'Asia/Tokyo';
 const JP_HOLIDAY_CAL_ID = 'ja.japanese#holiday@group.v.calendar.google.com';
+const META_START = '---META---';
+const META_END = '---ENDMETA---';
 
 // ===================== 共通ユーティリティ =====================
 function fmtDateJst_(d) {
@@ -34,6 +36,9 @@ function rfc3339Jst_(d) {
 function isValidDate_(d) {
   return d instanceof Date && !isNaN(d.getTime());
 }
+function clamp_(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
 function jsonOk_(obj) {
   return ContentService.createTextOutput(JSON.stringify(obj))
     .setMimeType(ContentService.MimeType.JSON);
@@ -42,6 +47,146 @@ function jsonErr_(code, message, extra) {
   const body = extra ? { error: { code, message, ...extra } } : { error: { code, message } };
   return ContentService.createTextOutput(JSON.stringify(body))
     .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ===================== メタ情報処理 / 優先度スコア =====================
+function sanitizeMetaValue_(value, depth) {
+  if (depth > 3) return undefined;
+  if (value === null) return null;
+  const type = typeof value;
+  if (type === 'string') return value;
+  if (type === 'number') return isFinite(value) ? value : undefined;
+  if (type === 'boolean') return value;
+  if (Array.isArray(value)) {
+    const arr = [];
+    for (let i = 0; i < value.length; i++) {
+      const sanitized = sanitizeMetaValue_(value[i], depth + 1);
+      if (sanitized !== undefined) arr.push(sanitized);
+    }
+    return arr;
+  }
+  if (type === 'object') {
+    const obj = {};
+    const keys = Object.keys(value);
+    for (let i = 0; i < keys.length; i++) {
+      const key = keys[i];
+      const sanitized = sanitizeMetaValue_(value[key], depth + 1);
+      if (sanitized !== undefined) obj[key] = sanitized;
+    }
+    return obj;
+  }
+  return undefined;
+}
+function sanitizeMetaRoot_(meta) {
+  if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return null;
+  const sanitized = sanitizeMetaValue_(meta, 0);
+  if (!sanitized || Array.isArray(sanitized)) return null;
+  const keys = Object.keys(sanitized);
+  return keys.length ? sanitized : null;
+}
+function parseDateFlexible_(value) {
+  if (!value) return null;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+      return new Date(`${trimmed}T00:00:00+09:00`);
+    }
+    const d = new Date(trimmed);
+    return isValidDate_(d) ? d : null;
+  }
+  return null;
+}
+function toNumberOrDefault_(value, defaultValue) {
+  if (typeof value === 'number' && isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim()) {
+    const num = Number(value);
+    if (!isNaN(num)) return num;
+  }
+  return defaultValue;
+}
+function computePriorityScore_(meta, explicitScore) {
+  if (typeof explicitScore === 'string' && explicitScore.trim()) {
+    const parsed = Number(explicitScore);
+    if (!isNaN(parsed)) {
+      return clamp_(Math.round(parsed * 100) / 100, 0, 100);
+    }
+  }
+  if (typeof explicitScore === 'number' && isFinite(explicitScore)) {
+    return clamp_(Math.round(explicitScore * 100) / 100, 0, 100);
+  }
+  if (!meta || typeof meta !== 'object') return null;
+
+  const metaWithDefaults = meta;
+  let deadlineScore = 0;
+  if (metaWithDefaults.deadline) {
+    const parsed = parseDateFlexible_(metaWithDefaults.deadline);
+    if (isValidDate_(parsed)) {
+      const dayStr = Utilities.formatDate(parsed, TZ, 'yyyy-MM-dd');
+      const deadlineStart = new Date(`${dayStr}T00:00:00+09:00`);
+      const todayStr = Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd');
+      const todayStart = new Date(`${todayStr}T00:00:00+09:00`);
+      const diffDays = Math.floor((deadlineStart.getTime() - todayStart.getTime()) / (24 * 60 * 60 * 1000));
+      deadlineScore = clamp_((30 - diffDays) * 2, 0, 60);
+    }
+  }
+
+  const impact = clamp_(toNumberOrDefault_(metaWithDefaults.impact, 3), 1, 5);
+  const effort = clamp_(toNumberOrDefault_(metaWithDefaults.effort, 3), 1, 5);
+  const must = (typeof metaWithDefaults.must === 'string')
+    ? metaWithDefaults.must.toLowerCase() === 'true'
+    : metaWithDefaults.must === true;
+
+  const impactScore = impact * 6;
+  const effortPenalty = effort * 3;
+  const mustBonus = must ? 10 : 0;
+  const rawScore = deadlineScore + impactScore - effortPenalty + mustBonus;
+  return clamp_(Math.round(rawScore * 100) / 100, 0, 100);
+}
+function mergePriorityIntoMeta_(meta, priorityScore) {
+  const hasMeta = meta && typeof meta === 'object' && !Array.isArray(meta);
+  const base = hasMeta ? JSON.parse(JSON.stringify(meta)) : {};
+  if (typeof priorityScore === 'number' && isFinite(priorityScore)) {
+    base.priorityScore = priorityScore;
+  } else if (hasMeta && typeof meta.priorityScore === 'number' && isFinite(meta.priorityScore)) {
+    base.priorityScore = clamp_(meta.priorityScore, 0, 100);
+  } else if (hasMeta && typeof meta.priorityScore === 'string' && meta.priorityScore.trim()) {
+    const parsed = Number(meta.priorityScore);
+    if (!isNaN(parsed)) base.priorityScore = clamp_(parsed, 0, 100);
+  }
+  const keys = Object.keys(base);
+  return keys.length ? base : null;
+}
+function splitDescriptionAndMeta_(description) {
+  const text = typeof description === 'string' ? description : '';
+  const regex = new RegExp(`${META_START}[\s\S]*?${META_END}`, 'm');
+  const match = text.match(regex);
+  if (!match) return { body: text, meta: null };
+
+  const metaBlock = match[0];
+  const metaJson = metaBlock
+    .replace(META_START, '')
+    .replace(META_END, '')
+    .trim();
+  let meta = null;
+  if (metaJson) {
+    try {
+      const parsed = JSON.parse(metaJson);
+      meta = sanitizeMetaRoot_(parsed);
+    } catch (err) {
+      console.warn('meta parse failed:', err && err.message);
+    }
+  }
+  const cleaned = text.replace(metaBlock, '').replace(/\s+$/, '');
+  return { body: cleaned.replace(/\n{3,}/g, '\n\n'), meta };
+}
+function buildDescriptionWithMeta_(description, metaObj) {
+  const base = splitDescriptionAndMeta_(typeof description === 'string' ? description : '');
+  const trimmed = base.body.replace(/\s+$/, '');
+  if (!metaObj) return trimmed;
+  const metaJson = JSON.stringify(metaObj);
+  const prefix = trimmed ? `${trimmed}\n\n` : '';
+  return `${prefix}${META_START}\n${metaJson}\n${META_END}`;
 }
 
 // ===================== カレンダー取得/URL補助 =====================
@@ -140,6 +285,16 @@ function normalizeEventItem_(item) {
   if (item.attendees && item.attendees.length) {
     out.attendees = item.attendees.map(a => ({ email: a.email, responseStatus: a.responseStatus }));
   }
+  const metaInfo = splitDescriptionAndMeta_(out.description || '');
+  if (metaInfo.meta) {
+    const priority = computePriorityScore_(metaInfo.meta, metaInfo.meta.priorityScore);
+    const mergedMeta = mergePriorityIntoMeta_(metaInfo.meta, priority);
+    if (mergedMeta) {
+      out.meta = mergedMeta;
+      if (typeof mergedMeta.priorityScore === 'number') out.priorityScore = mergedMeta.priorityScore;
+    }
+  }
+  out.descriptionPlain = metaInfo.body || '';
   return out;
 }
 /** ---- 期間内のイベント一覧 ----
@@ -244,16 +399,26 @@ function createEvent_CalendarApp_Timed_(title, description, start, end, calendar
   const ev  = cal.createEvent(title, start, end, { description: description || '' });
   const icalUid  = ev.getId();
   const htmlLink = tryGetHtmlLinkByIcalUid_(calendarId, icalUid);
-  return {
+  const desc = ev.getDescription() || '';
+  const metaInfo = splitDescriptionAndMeta_(desc);
+  const priority = metaInfo.meta ? computePriorityScore_(metaInfo.meta, metaInfo.meta.priorityScore) : null;
+  const mergedMeta = metaInfo.meta ? mergePriorityIntoMeta_(metaInfo.meta, priority) : null;
+  const result = {
     id: icalUid,
     htmlLink: htmlLink,
     summary: ev.getTitle(),
-    description: ev.getDescription() || '',
+    description: desc,
+    descriptionPlain: metaInfo.body || '',
     start: { dateTime: rfc3339Jst_(ev.getStartTime()), timeZone: TZ },
     end:   { dateTime: rfc3339Jst_(ev.getEndTime()),   timeZone: TZ },
     status: 'confirmed',
     creator: { email: Session.getActiveUser().getEmail() || '' }
   };
+  if (mergedMeta) {
+    result.meta = mergedMeta;
+    if (typeof mergedMeta.priorityScore === 'number') result.priorityScore = mergedMeta.priorityScore;
+  }
+  return result;
 }
 function createEvent_CalendarApp_AllDay_(title, description, dateStr, calendarId) {
   const cal = getCalendarByIdOrDefault_(calendarId);
@@ -264,16 +429,26 @@ function createEvent_CalendarApp_AllDay_(title, description, dateStr, calendarId
   const ev  = cal.createAllDayEvent(title, d, { description: description || '' });
   const icalUid  = ev.getId();
   const htmlLink = tryGetHtmlLinkByIcalUid_(calendarId, icalUid);
-  return {
+  const desc = ev.getDescription() || '';
+  const metaInfo = splitDescriptionAndMeta_(desc);
+  const priority = metaInfo.meta ? computePriorityScore_(metaInfo.meta, metaInfo.meta.priorityScore) : null;
+  const mergedMeta = metaInfo.meta ? mergePriorityIntoMeta_(metaInfo.meta, priority) : null;
+  const result = {
     id: icalUid,
     htmlLink: htmlLink,
     summary: ev.getTitle(),
-    description: ev.getDescription() || '',
+    description: desc,
+    descriptionPlain: metaInfo.body || '',
     start: { date: fmtDateJst_(d) },
     end:   { date: fmtDateJst_(d) },
     status: 'confirmed',
     creator: { email: Session.getActiveUser().getEmail() || '' }
   };
+  if (mergedMeta) {
+    result.meta = mergedMeta;
+    if (typeof mergedMeta.priorityScore === 'number') result.priorityScore = mergedMeta.priorityScore;
+  }
+  return result;
 }
 function createEvent_Advanced_Timed_(title, description, start, end, calendarId) {
   const calId = calendarId || 'primary';
@@ -283,7 +458,19 @@ function createEvent_Advanced_Timed_(title, description, start, end, calendarId)
     start: { dateTime: rfc3339Jst_(start), timeZone: TZ },
     end:   { dateTime: rfc3339Jst_(end),   timeZone: TZ }
   };
-  return Calendar.Events.insert(event, calId);
+  const inserted = Calendar.Events.insert(event, calId);
+  const desc = (inserted && inserted.description) || event.description || '';
+  const metaInfo = splitDescriptionAndMeta_(desc);
+  const priority = metaInfo.meta ? computePriorityScore_(metaInfo.meta, metaInfo.meta.priorityScore) : null;
+  const mergedMeta = metaInfo.meta ? mergePriorityIntoMeta_(metaInfo.meta, priority) : null;
+  const result = inserted || {};
+  result.description = desc;
+  result.descriptionPlain = metaInfo.body || '';
+  if (mergedMeta) {
+    result.meta = mergedMeta;
+    if (typeof mergedMeta.priorityScore === 'number') result.priorityScore = mergedMeta.priorityScore;
+  }
+  return result;
 }
 function createEvent_Advanced_AllDay_(title, description, dateStr, calendarId) {
   const calId = calendarId || 'primary';
@@ -298,7 +485,19 @@ function createEvent_Advanced_AllDay_(title, description, dateStr, calendarId) {
     start: { date: fmtDateJst_(d) },
     end:   { date: fmtDateJst_(next) }
   };
-  return Calendar.Events.insert(event, calId);
+  const inserted = Calendar.Events.insert(event, calId);
+  const desc = (inserted && inserted.description) || event.description || '';
+  const metaInfo = splitDescriptionAndMeta_(desc);
+  const priority = metaInfo.meta ? computePriorityScore_(metaInfo.meta, metaInfo.meta.priorityScore) : null;
+  const mergedMeta = metaInfo.meta ? mergePriorityIntoMeta_(metaInfo.meta, priority) : null;
+  const result = inserted || {};
+  result.description = desc;
+  result.descriptionPlain = metaInfo.body || '';
+  if (mergedMeta) {
+    result.meta = mergedMeta;
+    if (typeof mergedMeta.priorityScore === 'number') result.priorityScore = mergedMeta.priorityScore;
+  }
+  return result;
 }
 
 // ===================== Web エンドポイント =====================
@@ -336,9 +535,14 @@ function doPost(e) {
     const title = (data.title || '').trim();
     if (!title) return jsonErr_(400, 'title is required');
 
-    const description = data.description || '';
+    const rawDescription = typeof data.description === 'string' ? data.description : '';
     const calendarId  = data.calendarId || null;
     const useAdvanced = data.useAdvanced === true;
+
+    const sanitizedMeta = sanitizeMetaRoot_(data.meta);
+    const priorityScore = computePriorityScore_(sanitizedMeta, data.priorityScore);
+    const metaForStorage = mergePriorityIntoMeta_(sanitizedMeta, priorityScore);
+    const description = buildDescriptionWithMeta_(rawDescription, metaForStorage);
 
     // 営業時間（上書き可）
     const windows = Array.isArray(data.businessWindows) && data.businessWindows.length
@@ -361,6 +565,13 @@ function doPost(e) {
       const created = useAdvanced
         ? createEvent_Advanced_AllDay_(title, description, dateStr, calendarId)
         : createEvent_CalendarApp_AllDay_(title, description, dateStr, calendarId);
+      if (metaForStorage) {
+        created.meta = created.meta || metaForStorage;
+        if (typeof priorityScore === 'number') {
+          created.priorityScore = typeof created.priorityScore === 'number' ? created.priorityScore : priorityScore;
+          created.meta.priorityScore = created.priorityScore;
+        }
+      }
       return jsonOk_(created);
     }
 
@@ -420,6 +631,14 @@ function doPost(e) {
     const created = useAdvanced
       ? createEvent_Advanced_Timed_(title, description, start, end, calendarId)
       : createEvent_CalendarApp_Timed_(title, description, start, end, calendarId);
+
+    if (metaForStorage) {
+      created.meta = created.meta || metaForStorage;
+      if (typeof priorityScore === 'number') {
+        created.priorityScore = typeof created.priorityScore === 'number' ? created.priorityScore : priorityScore;
+        created.meta.priorityScore = created.priorityScore;
+      }
+    }
 
     return jsonOk_(created);
 
