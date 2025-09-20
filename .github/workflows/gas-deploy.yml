@@ -1,0 +1,40 @@
+name: Deploy GAS (clasp)
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      GAS_EXEC_URL: ${{ secrets.GAS_EXEC_URL }}
+      GAS_SCRIPT_ID: ${{ secrets.GAS_SCRIPT_ID }}
+      GAS_DEPLOY_ID: ${{ secrets.GAS_DEPLOY_ID }}   # 既存デプロイを再利用しないなら空でOK
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore ~/.clasprc.json
+        run: |
+          mkdir -p ~
+          echo "${{ secrets.CLASPRC_JSON_B64 }}" | base64 -d > ~/.clasprc.json
+          chmod 600 ~/.clasprc.json
+      - name: Create .clasp.json
+        run: |
+          cat > .clasp.json <<EOF
+          { "scriptId": "${GAS_SCRIPT_ID}", "rootDir": "src" }
+          EOF
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - run: npm i -g @google/clasp
+      - name: Push source to Apps Script
+        run: npx clasp push --force
+      - name: Deploy (reuse existing)
+        if: ${{ env.GAS_DEPLOY_ID != '' }}
+        run: npx clasp deploy -i "$GAS_DEPLOY_ID"
+      - name: Deploy (create new)
+        if: ${{ env.GAS_DEPLOY_ID == '' }}
+        run: npx clasp deploy
+      - name: Smoke test (list API)
+        run: |
+          curl -sS -X POST -H "Content-Type: application/json" \
+            -d '{"action":"list","timeMin":"2025-09-22","timeMax":"2025-09-28"}' \
+            "$GAS_EXEC_URL" | jq .
