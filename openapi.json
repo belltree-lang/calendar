@@ -1,0 +1,156 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Googleカレンダー連携 API",
+    "version": "1.2.3",
+    "description": "GAS 経由で Google カレンダーに予定を作成・照会（list/freebusy）。時間指定/終日/別カレンダー/自動衝突回避/翌営業日ロール対応。JST想定。"
+  },
+  "servers": [
+    { "url": "https://script.google.com" }
+  ],
+  "paths": {
+    "/macros/s/AKfycbypOoVr97oE5BDjzIluKtU9rmDbIEJR0C-1b0mhlUSiBsljGRlzn59IwAmsKEp5lW-t3A/exec": {
+      "post": {
+        "operationId": "scheduleOrFreebusy",
+        "summary": "予定作成 / 一覧 / FreeBusy（actionで切替）",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "action": {
+                    "type": "string",
+                    "description": "list/freebusy 指定時は照会モード。未指定は予定作成。"
+                  },
+                  "calendarId": { "type": "string" },
+                  "timeMin": {
+                    "type": "string",
+                    "description": "一覧・空き照会の開始日時 (YYYY-MM-DD または RFC3339)"
+                  },
+                  "timeMax": {
+                    "type": "string",
+                    "description": "一覧・空き照会の終了日時 (YYYY-MM-DD または RFC3339)"
+                  },
+                  "pageToken": { "type": "string" },
+                  "title": { "type": "string" },
+                  "description": { "type": "string" },
+                  "date": {
+                    "type": "string",
+                    "description": "予定日 (YYYY-MM-DD)",
+                    "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+                  },
+                  "startTime": {
+                    "type": "string",
+                    "description": "開始時刻 (HH:mm)",
+                    "pattern": "^\\d{2}:\\d{2}$"
+                  },
+                  "endTime": {
+                    "type": "string",
+                    "description": "終了時刻 (HH:mm)",
+                    "pattern": "^\\d{2}:\\d{2}$"
+                  },
+                  "durationHours": { "type": "number" },
+                  "allDay": { "type": "boolean" },
+                  "useAdvanced": { "type": "boolean" },
+                  "allowWeekendHoliday": { "type": "boolean" },
+                  "businessWindows": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "営業時間の候補配列 (例: ['04:30-06:30','08:00-19:00'])"
+                  },
+                  "minGapMinutes": { "type": "number" },
+                  "autoAvoidConflict": { "type": "boolean" },
+                  "meta": {
+                    "type": "object",
+                    "description": "タスクメタ情報（プロジェクト/締切/難易度など）",
+                    "properties": {
+                      "project": { "type": "string" },
+                      "deadline": { "type": "string" },
+                      "impact": { "type": "number" },
+                      "effort": { "type": "number" },
+                      "must": { "type": "boolean" },
+                      "tags": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                      },
+                      "priorityScore": { "type": "number" }
+                    },
+                    "additionalProperties": true
+                  },
+                  "priorityScore": {
+                    "type": "number",
+                    "description": "GPT 計算済みの優先度スコア（指定が無ければ GAS 側で算出）"
+                  }
+                },
+                "additionalProperties": true
+              },
+              "examples": {
+                "CreateSimple": {
+                  "value": {
+                    "title": "テストスケジュール",
+                    "date": "2025-09-22",
+                    "startTime": "10:00",
+                    "durationHours": 1
+                  }
+                },
+                "CreateWithMeta": {
+                  "value": {
+                    "title": "資料ドラフト",
+                    "date": "2025-09-22",
+                    "startTime": "09:30",
+                    "durationHours": 1.5,
+                    "meta": {
+                      "project": "二次審査",
+                      "deadline": "2025-09-25",
+                      "impact": 5,
+                      "effort": 3,
+                      "tags": ["proposal"],
+                      "must": true
+                    },
+                    "priorityScore": 86
+                  }
+                },
+                "ListWeek": {
+                  "value": { "action": "list", "timeMin": "2025-09-22", "timeMax": "2025-09-28" }
+                },
+                "FreeBusy": {
+                  "value": { "action": "freebusy", "timeMin": "2025-09-22T00:00:00+09:00", "timeMax": "2025-09-23T00:00:00+09:00" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "成功時：イベント情報 or 一覧/Busy。アプリ内エラーも200+Errorオブジェクトで返る場合あり（GAS実装準拠）。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "id": { "type": "string" },
+                    "htmlLink": { "type": "string" },
+                    "summary": { "type": "string" },
+                    "description": { "type": "string" },
+                    "descriptionPlain": { "type": "string" },
+                    "meta": {
+                      "type": "object",
+                      "description": "---META--- ブロックから抽出された情報",
+                      "additionalProperties": true
+                    },
+                    "priorityScore": { "type": "number" },
+                    "start": { "type": "object" },
+                    "end": { "type": "object" }
+                  },
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
