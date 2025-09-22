@@ -49,6 +49,12 @@ function jsonErr_(code, message, extra) {
     .setMimeType(ContentService.MimeType.JSON);
 }
 
+function toJstDate_(date) {
+  if (!isValidDate_(date)) return null;
+  const iso = Utilities.formatDate(date, TZ, "yyyy-MM-dd'T'HH:mm:ssXXX");
+  return new Date(iso);
+}
+
 // ===================== メタ情報処理 / 優先度スコア =====================
 function sanitizeMetaValue_(value, depth) {
   if (depth > 3) return undefined;
@@ -216,6 +222,29 @@ function tryGetHtmlLinkByIcalUid_(calendarId, icalUid) {
   }
 }
 
+function fetchEventById_(calendarId, eventIdOrIcalUid) {
+  if (!eventIdOrIcalUid) return null;
+  const calId = calendarId || 'primary';
+  try {
+    return Calendar.Events.get(calId, eventIdOrIcalUid);
+  } catch (err) {
+    console.warn('fetchEventById_: direct get failed', err && err.message);
+  }
+  try {
+    const res = Calendar.Events.list(calId, {
+      iCalUID: eventIdOrIcalUid,
+      maxResults: 1,
+      singleEvents: true
+    });
+    if (res && res.items && res.items.length > 0) {
+      return res.items[0];
+    }
+  } catch (err2) {
+    console.warn('fetchEventById_: lookup by iCalUID failed', err2 && err2.message);
+  }
+  return null;
+}
+
 // ===================== JP 祝日 / 営業日判定 =====================
 function isWeekend_(d) {
   const day = d.getDay(); // 0:日, 6:土
@@ -324,6 +353,296 @@ function listEvents_(timeMinStr, timeMaxStr, calendarId, pageToken) {
   const out = { items };
   if (res.nextPageToken) out.nextPageToken = res.nextPageToken;
   return out;
+}
+
+// ===================== 補助機能 (Nudge / Reschedule) =====================
+function getEventStartDate_(event) {
+  if (event && event.start) {
+    if (event.start.dateTime) return new Date(event.start.dateTime);
+    if (event.start.date) return new Date(`${event.start.date}T00:00:00+09:00`);
+  }
+  return null;
+}
+
+function getEventEndDate_(event) {
+  if (event && event.end) {
+    if (event.end.dateTime) return new Date(event.end.dateTime);
+    if (event.end.date) return new Date(`${event.end.date}T00:00:00+09:00`);
+  }
+  return null;
+}
+
+function isAllDayEvent_(event) {
+  return !!(event && event.start && event.start.date && !event.start.dateTime);
+}
+
+function isTruthyFlag_(value) {
+  if (value === true) return true;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    return normalized === 'true' || normalized === 'done' || normalized === 'completed' || normalized === '完了' || normalized === '済';
+  }
+  return false;
+}
+
+function isEventCompleted_(event) {
+  if (!event) return false;
+  const meta = event.meta || {};
+  if (isTruthyFlag_(meta.completed)) return true;
+  if (isTruthyFlag_(meta.done)) return true;
+  if (isTruthyFlag_(meta.status)) return true;
+  if (meta.progress && typeof meta.progress === 'string') {
+    if (isTruthyFlag_(meta.progress)) return true;
+  }
+  if (typeof event.summary === 'string' && /^\s*(✅|✔|\[done\]|\[完了\]|完了|済)/i.test(event.summary)) return true;
+  return false;
+}
+
+function determinePreferredStartTime_(priorityScore, originalStart) {
+  if (typeof priorityScore === 'number' && isFinite(priorityScore)) {
+    if (priorityScore >= 85) return '08:30';
+    if (priorityScore >= 70) return '09:30';
+    if (priorityScore >= 55) return '11:00';
+    if (priorityScore >= 40) return '13:30';
+  }
+  if (isValidDate_(originalStart)) {
+    return Utilities.formatDate(originalStart, TZ, 'HH:mm');
+  }
+  return '15:00';
+}
+
+function generateNudgeForEvent_(normalizedEvent) {
+  const summary = (normalizedEvent && normalizedEvent.summary) ? normalizedEvent.summary : 'タスク';
+  const meta = (normalizedEvent && normalizedEvent.meta) ? normalizedEvent.meta : {};
+  const descriptionPlain = (normalizedEvent && typeof normalizedEvent.descriptionPlain === 'string')
+    ? normalizedEvent.descriptionPlain
+    : '';
+  const lines = descriptionPlain
+    .split(/\n+/)
+    .map(line => line.trim())
+    .filter(line => line.length > 0);
+
+  const firstStepCandidates = [];
+  if (meta.project) firstStepCandidates.push(`プロジェクト「${meta.project}」のゴールを確認`);
+  if (lines.length) firstStepCandidates.push(`メモ「${lines[0]}」を読み返す`);
+  const firstStep = firstStepCandidates.length
+    ? firstStepCandidates[0]
+    : `まずは「${summary}」の目的を整理しましょう`;
+
+  const checklist = [];
+  if (meta.deadline) checklist.push(`締切 ${meta.deadline} をカレンダーで確認`);
+  if (Array.isArray(meta.tags) && meta.tags.length) {
+    checklist.push(`関連タグ: ${meta.tags.slice(0, 3).join(', ')}`);
+  }
+  for (let i = 0; i < lines.length && checklist.length < 5; i++) {
+    checklist.push(`メモ確認: ${lines[i]}`);
+  }
+  const checklistDefaults = [
+    '必要な資料やリンクを開く',
+    '完了条件を箇条書きにする',
+    '5分でできる最初のアクションを決める'
+  ];
+  for (let i = 0; i < checklistDefaults.length; i++) {
+    if (checklist.indexOf(checklistDefaults[i]) === -1) {
+      checklist.push(checklistDefaults[i]);
+    }
+  }
+
+  const priorityScore = (normalizedEvent && typeof normalizedEvent.priorityScore === 'number')
+    ? normalizedEvent.priorityScore
+    : null;
+  const ifThen = [];
+  if (priorityScore !== null && priorityScore >= 80) {
+    ifThen.push('もしブロッカーがあれば→すぐに関係者へ相談');
+  } else if (priorityScore !== null && priorityScore >= 60) {
+    ifThen.push('もし時間が足りなければ→翌日の午前に再配置');
+  } else {
+    ifThen.push('進捗が止まったら→15分のフォローアップ枠を確保');
+  }
+  if (meta.deadline) {
+    ifThen.push(`締切 ${meta.deadline} に間に合わない場合→優先度とリスケを再検討`);
+  }
+
+  const uniqueChecklist = Array.from(new Set(checklist)).slice(0, 5);
+  const uniqueIfThen = Array.from(new Set(ifThen));
+
+  return {
+    firstStep,
+    checklist: uniqueChecklist,
+    ifThen: uniqueIfThen,
+    context: {
+      summary,
+      priorityScore: priorityScore !== null ? priorityScore : undefined,
+      start: normalizedEvent && normalizedEvent.start ? normalizedEvent.start : undefined
+    }
+  };
+}
+
+function shouldRescheduleEvent_(event, referenceTime) {
+  if (!event) return false;
+  if (isEventCompleted_(event)) return false;
+  const meta = event.meta || {};
+  if (meta.autoReschedule === false) return false;
+  if (typeof meta.autoReschedule === 'string' && meta.autoReschedule.trim().toLowerCase() === 'false') {
+    return false;
+  }
+  const start = getEventStartDate_(event);
+  if (!isValidDate_(start)) return false;
+  if (!isValidDate_(referenceTime)) return false;
+  return start.getTime() <= referenceTime.getTime();
+}
+
+function pickBusinessWindows_(candidate, fallback) {
+  if (Array.isArray(candidate) && candidate.length) {
+    const filtered = candidate
+      .map(v => (typeof v === 'string' ? v.trim() : ''))
+      .filter(v => /^\d{2}:\d{2}-\d{2}:\d{2}$/.test(v));
+    if (filtered.length) return filtered;
+  }
+  return fallback;
+}
+
+function reschedulePendingEvents_(options) {
+  const calendarId = (options && options.calendarId) || null;
+  const referenceRaw = options && options.referenceTime ? new Date(options.referenceTime) : new Date();
+  const referenceBase = isValidDate_(referenceRaw) ? referenceRaw : new Date();
+  const referenceJst = toJstDate_(referenceBase) || new Date();
+
+  const dayStr = Utilities.formatDate(referenceJst, TZ, 'yyyy-MM-dd');
+  const hour = Number(Utilities.formatDate(referenceJst, TZ, 'HH'));
+  const minute = Number(Utilities.formatDate(referenceJst, TZ, 'mm'));
+  const cutoffReached = hour > 20 || (hour === 20 && minute >= 0);
+  if (!cutoffReached) {
+    return { checkedAt: rfc3339Jst_(referenceJst), rescheduled: [] };
+  }
+
+  const defaultWindows = (options && Array.isArray(options.businessWindows) && options.businessWindows.length)
+    ? pickBusinessWindows_(options.businessWindows, ['04:30-06:30', '08:00-19:00'])
+    : ['04:30-06:30', '08:00-19:00'];
+  const minGapMinutes = (options && typeof options.minGapMinutes === 'number') ? options.minGapMinutes : 15;
+  const allowWeekendHoliday = options && options.allowWeekendHoliday === true;
+
+  const list = listEvents_(dayStr, dayStr, calendarId, null);
+  const events = (list.items || []).filter(ev => ev && ev.status !== 'cancelled');
+  const referenceTime = new Date(`${dayStr}T${Utilities.formatDate(referenceJst, TZ, 'HH:mm:ss')}+09:00`);
+  const candidates = events.filter(ev => shouldRescheduleEvent_(ev, referenceTime));
+  if (!candidates.length) {
+    return { checkedAt: rfc3339Jst_(referenceJst), rescheduled: [] };
+  }
+
+  const prepared = candidates.map(ev => {
+    let baseMeta = sanitizeMetaRoot_(ev.meta);
+    if (!baseMeta) baseMeta = {};
+    else baseMeta = JSON.parse(JSON.stringify(baseMeta));
+    if (baseMeta && typeof baseMeta.priorityScore !== 'undefined') {
+      delete baseMeta.priorityScore;
+    }
+    const computedPriority = computePriorityScore_(baseMeta, null);
+    let priorityValue;
+    if (typeof computedPriority === 'number' && isFinite(computedPriority)) {
+      priorityValue = computedPriority;
+    } else if (typeof ev.priorityScore === 'number' && isFinite(ev.priorityScore)) {
+      priorityValue = clamp_(ev.priorityScore, 0, 100);
+    } else {
+      priorityValue = 50;
+    }
+    priorityValue = clamp_(Math.round(priorityValue * 100) / 100, 0, 100);
+    return { raw: ev, metaBase: baseMeta, priority: priorityValue };
+  });
+
+  prepared.sort((a, b) => {
+    if (b.priority !== a.priority) return b.priority - a.priority;
+    const startA = getEventStartDate_(a.raw);
+    const startB = getEventStartDate_(b.raw);
+    const timeA = isValidDate_(startA) ? startA.getTime() : 0;
+    const timeB = isValidDate_(startB) ? startB.getTime() : 0;
+    return timeA - timeB;
+  });
+
+  const startDay = new Date(`${dayStr}T00:00:00+09:00`);
+  const firstTarget = nextBusinessDay_(startDay, allowWeekendHoliday);
+  const startDateStr = fmtDateJst_(firstTarget);
+  const calId = calendarId || 'primary';
+  const rescheduled = [];
+  const errors = [];
+
+  for (let i = 0; i < prepared.length; i++) {
+    const entry = prepared[i];
+    const event = entry.raw;
+    const eventId = event.eventId || event.id;
+    if (!eventId) {
+      errors.push({ id: event.id || '', message: 'eventId missing' });
+      continue;
+    }
+    try {
+      const eventWindows = pickBusinessWindows_(entry.metaBase.businessWindows, defaultWindows);
+      const eventAllowWeekend = entry.metaBase.allowWeekendHoliday === true ? true : allowWeekendHoliday;
+      const eventMinGap = (typeof entry.metaBase.minGapMinutes === 'number') ? entry.metaBase.minGapMinutes : minGapMinutes;
+      const metaForStorage = mergePriorityIntoMeta_(entry.metaBase, entry.priority) || {};
+      metaForStorage.lastRescheduledAt = rfc3339Jst_(referenceJst);
+      const prevCount = (typeof entry.metaBase.rescheduleCount === 'number' && isFinite(entry.metaBase.rescheduleCount))
+        ? entry.metaBase.rescheduleCount
+        : 0;
+      metaForStorage.rescheduleCount = prevCount + 1;
+      const originalStart = getEventStartDate_(event);
+      if (isValidDate_(originalStart)) {
+        metaForStorage.previousStart = rfc3339Jst_(originalStart);
+      }
+
+      if (isAllDayEvent_(event)) {
+        let targetDate = new Date(`${startDateStr}T00:00:00+09:00`);
+        if (!isBusinessDay_(targetDate, eventAllowWeekend)) {
+          targetDate = nextBusinessDay_(targetDate, eventAllowWeekend);
+        }
+        const targetDateStr = fmtDateJst_(targetDate);
+        const nextDate = new Date(targetDate.getTime() + 24 * 60 * 60 * 1000);
+        const update = {
+          start: { date: targetDateStr },
+          end: { date: fmtDateJst_(nextDate) },
+          description: buildDescriptionWithMeta_(event.description || '', metaForStorage)
+        };
+        const patched = Calendar.Events.patch(update, calId, eventId);
+        const normalized = normalizeEventItem_(patched);
+        rescheduled.push({
+          id: normalized.id || event.id || eventId,
+          eventId: normalized.eventId || eventId,
+          newDate: targetDateStr,
+          priorityScore: (typeof normalized.priorityScore === 'number') ? normalized.priorityScore : entry.priority
+        });
+        continue;
+      }
+
+      const startDate = getEventStartDate_(event);
+      const endDate = getEventEndDate_(event);
+      const durationHours = (isValidDate_(startDate) && isValidDate_(endDate))
+        ? Math.max((endDate.getTime() - startDate.getTime()) / (60 * 60 * 1000), 0.5)
+        : 1;
+      const prefer = determinePreferredStartTime_(entry.priority, startDate);
+      const slot = findNextFreeSlotAcrossDays_(calendarId, startDateStr, prefer, durationHours, eventWindows, eventMinGap, eventAllowWeekend);
+      const update = {
+        start: { dateTime: rfc3339Jst_(slot.start), timeZone: TZ },
+        end: { dateTime: rfc3339Jst_(slot.end), timeZone: TZ },
+        description: buildDescriptionWithMeta_(event.description || '', metaForStorage)
+      };
+      const patched = Calendar.Events.patch(update, calId, eventId);
+      const normalized = normalizeEventItem_(patched);
+      rescheduled.push({
+        id: normalized.id || event.id || eventId,
+        eventId: normalized.eventId || eventId,
+        newDate: fmtDateJst_(slot.start),
+        newStart: normalized.start || { dateTime: rfc3339Jst_(slot.start), timeZone: TZ },
+        priorityScore: (typeof normalized.priorityScore === 'number') ? normalized.priorityScore : entry.priority
+      });
+    } catch (err) {
+      console.warn('reschedulePendingEvents_: failed', eventId, err && err.message);
+      errors.push({ id: event.id || eventId, message: err && err.message });
+    }
+  }
+
+  const response = { checkedAt: rfc3339Jst_(referenceJst), rescheduled };
+  if (prepared.length) response.candidates = prepared.length;
+  if (errors.length) response.errors = errors;
+  return response;
 }
 
 // ===================== 空き枠探索（1日 / 複数ウィンドウ対応） =====================
@@ -512,6 +831,27 @@ function doPost(e) {
       return jsonErr_(400, 'empty payload');
     }
     const data = JSON.parse(e.postData.contents);
+
+    if (data.action === 'nudge') {
+      const eventId = (data.eventId || '').trim();
+      if (!eventId) return jsonErr_(400, 'eventId required');
+      const event = fetchEventById_(data.calendarId || null, eventId);
+      if (!event) return jsonErr_(404, 'event not found', { eventId });
+      const normalized = normalizeEventItem_(event);
+      const suggestion = generateNudgeForEvent_(normalized);
+      return jsonOk_({ ...suggestion, event: normalized });
+    }
+
+    if (data.action === 'reschedulePending') {
+      const result = reschedulePendingEvents_({
+        calendarId: data.calendarId || null,
+        referenceTime: data.time || null,
+        businessWindows: Array.isArray(data.businessWindows) ? data.businessWindows : null,
+        minGapMinutes: (typeof data.minGapMinutes === 'number') ? data.minGapMinutes : null,
+        allowWeekendHoliday: data.allowWeekendHoliday === true
+      });
+      return jsonOk_(result);
+    }
 
     // ---- 一覧取得 ----
     if (data.action === 'list') {
